@@ -9,6 +9,32 @@ import urllib.request
 import urllib.error
 import itertools
 
+def init_follow_pool_dict():
+    if 'follow_pool_dict' not in st.session_state:
+        st.session_state.follow_pool_dict = {}
+    
+    follow_data_dir = 'follow_data'
+    if os.path.exists(follow_data_dir):
+        for filename in os.listdir(follow_data_dir):
+            if filename.endswith('跟随号.json'):
+                filepath = os.path.join(follow_data_dir, filename)
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        target_period = data.get('target_period', '')
+                        if target_period:
+                            st.session_state.follow_pool_dict[target_period] = {
+                                'unique_follow_nums': data.get('unique_follow_nums', []),
+                                'draw_numbers': data.get('draw_numbers', []),
+                                'analysis_period': data.get('analysis_period', ''),
+                                'source_period': data.get('draw_period', ''),
+                                'save_time': data.get('save_time', '')
+                            }
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+init_follow_pool_dict()
+
 # ==================== 【模块0】GitHub Gist API 云端持久化配置 ====================
 GIST_CONFIG_KEY = 'gist_config'
 
@@ -301,6 +327,572 @@ def cloud_load_hit_rates(config):
     if content:
         return json.loads(content)
     return None
+
+# ==================== 【预测系统核心辅助函数】 ====================
+
+def get_span(nums):
+    """计算跨度（最大号 - 最小号）"""
+    return max(nums) - min(nums)
+
+def get_sum_value(nums):
+    """计算和值"""
+    return sum(nums)
+
+def get_odd_count(nums):
+    """计算奇数个数"""
+    return sum(1 for n in nums if n % 2 == 1)
+
+def get_even_count(nums):
+    """计算偶数个数"""
+    return sum(1 for n in nums if n % 2 == 0)
+
+def get_road(n):
+    """获取号码的012路（n % 3）"""
+    return n % 3
+
+def get_road_count(nums, road):
+    """计算某路号码个数"""
+    return sum(1 for n in nums if n % 3 == road)
+
+def calculate_omission(data, num):
+    """计算号码的遗漏期数（从最新期开始）"""
+    for i, (_, row) in enumerate(data.iloc[::-1].iterrows()):
+        if num in row.values:
+            return i
+    return len(data)
+
+def calculate_hotness(data, num, periods=10):
+    """计算号码热度（近N期出现次数，使用最新的N期）"""
+    recent_data = data.tail(periods)
+    count = 0
+    for _, row in recent_data.iterrows():
+        if num in row.values:
+            count += 1
+    return count
+
+def get_segments():
+    """获取5个分段的区间（彩侠原版位次分段的天然区间）"""
+    return [
+        (1, 20),
+        (10, 40),
+        (30, 60),
+        (40, 70),
+        (60, 80)
+    ]
+
+def get_segment(num):
+    """获取号码所属分段"""
+    segments = get_segments()
+    for i, (start, end) in enumerate(segments):
+        if start <= num <= end:
+            return i
+    return -1
+
+def get_hot_level(hotness):
+    """根据热度获取冷热等级"""
+    if hotness >= 5:
+        return '热号'
+    elif hotness >= 3:
+        return '温号'
+    else:
+        return '冷号'
+
+def get_all_numbers():
+    """获取所有号码1-80"""
+    return list(range(1, 81))
+
+def get_road_numbers(road):
+    """获取某路的所有号码"""
+    return [n for n in range(1, 81) if n % 3 == road]
+
+def get_odd_numbers():
+    """获取所有奇数"""
+    return [n for n in range(1, 81) if n % 2 == 1]
+
+def get_even_numbers():
+    """获取所有偶数"""
+    return [n for n in range(1, 81) if n % 2 == 0]
+
+# ==================== 【第一层：宏观边界层】 ====================
+
+def predict_span(data):
+    """跨度预判（菲姐・振幅周期法）- 近10期，近5期权重70%，远5期权重30%"""
+    if len(data) < 11:
+        return None, None, None
+    
+    recent_10 = data.head(10)
+    spans = []
+    for _, row in recent_10.iterrows():
+        nums = [int(n) for n in row.values if pd.notna(n)]
+        spans.append(get_span(nums))
+    
+    amplitudes = [abs(spans[i] - spans[i-1]) for i in range(1, len(spans))]
+    last_amplitude = amplitudes[-1]
+    
+    last_span = spans[-1]
+    
+    if last_amplitude <= 3:
+        period_type = '收窄期'
+        candidates = [last_span + i for i in range(-2, 3) if 1 <= last_span + i <= 79]
+    elif last_amplitude <= 9:
+        period_type = '正常期'
+        candidates = [last_span + i for i in range(-3, 4) if 1 <= last_span + i <= 79]
+    else:
+        period_type = '放大期'
+        candidates = [last_span + i for i in range(-5, 6) if 1 <= last_span + i <= 79]
+    
+    span_counter_recent = Counter(spans[-5:])
+    span_counter_far = Counter(spans[:5])
+    
+    weighted_counter = {}
+    for span in set(spans):
+        weighted_counter[span] = span_counter_recent.get(span, 0) * 0.7 + span_counter_far.get(span, 0) * 0.3
+    
+    most_common_spans = sorted(weighted_counter.items(), key=lambda x: x[1], reverse=True)[:3]
+    
+    if candidates:
+        main_prediction = max(candidates, key=lambda x: weighted_counter.get(x, 0))
+        span_range = (main_prediction - 1, main_prediction + 1)
+    else:
+        main_prediction = last_span
+        span_range = (last_span - 1, last_span + 1)
+    
+    return span_range, period_type, {'spans': spans, 'amplitudes': amplitudes, 'most_common': most_common_spans, 'weighted_counter': weighted_counter}
+
+def predict_odd_even_ratio(data):
+    """奇偶比预判（凡哥・冷热转换法）- 近7期+近3期，近3期权重60%，远4期权重40%"""
+    if len(data) < 8:
+        return None, None
+    
+    recent_7 = data.head(7)
+    recent_3 = data.head(3)
+    far_4 = data.iloc[3:7]
+    
+    s7 = sum(get_odd_count([int(n) for n in row.values if pd.notna(n)]) for _, row in recent_7.iterrows())
+    e7 = 140 - s7
+    d7 = abs(s7 - e7)
+    
+    s3 = sum(get_odd_count([int(n) for n in row.values if pd.notna(n)]) for _, row in recent_3.iterrows())
+    e3 = 60 - s3
+    d3 = abs(s3 - e3)
+    
+    s_far4 = sum(get_odd_count([int(n) for n in row.values if pd.notna(n)]) for _, row in far_4.iterrows())
+    e_far4 = 80 - s_far4
+    
+    weighted_difference = d3 * 0.6 + abs(s_far4 - e_far4) * 0.4
+    
+    consecutive_count = 0
+    last_odd_count = None
+    for _, row in recent_3.iterrows():
+        current_odd = get_odd_count([int(n) for n in row.values if pd.notna(n)])
+        if last_odd_count is not None:
+            if (current_odd >= 12 and last_odd_count >= 12) or (current_odd <= 8 and last_odd_count <= 8):
+                consecutive_count += 1
+        last_odd_count = current_odd
+    
+    if consecutive_count >= 1:
+        odd_min, odd_max = 8, 10
+    elif d7 >= 5 and d3 <= 3:
+        if s7 > e7:
+            odd_min, odd_max = 8, 10
+        else:
+            odd_min, odd_max = 11, 13
+    else:
+        odd_min, odd_max = 9, 11
+    
+    even_min = 20 - odd_max
+    even_max = 20 - odd_min
+    
+    return (odd_min, odd_max), (even_min, even_max), {'d7': d7, 'd3': d3, 'weighted_diff': weighted_difference, 'consecutive_count': consecutive_count}
+
+def predict_road_counts(data):
+    """012路个数预判（菲姐・趋势均值法）- 近10期+近5期，近5期权重60%，远5期权重40%"""
+    if len(data) < 11:
+        return None, None
+    
+    recent_10 = data.head(10)
+    recent_5 = data.head(5)
+    far_5 = data.iloc[5:10]
+    
+    road_counts_10 = {0: [], 1: [], 2: []}
+    for _, row in recent_10.iterrows():
+        nums = [int(n) for n in row.values if pd.notna(n)]
+        for r in [0, 1, 2]:
+            road_counts_10[r].append(get_road_count(nums, r))
+    
+    road_means_recent5 = {r: sum(road_counts_10[r][-5:]) / 5 for r in [0, 1, 2]}
+    road_means_far5 = {r: sum(road_counts_10[r][:5]) / 5 for r in [0, 1, 2]}
+    
+    road_means_weighted = {r: road_means_recent5[r] * 0.6 + road_means_far5[r] * 0.4 for r in [0, 1, 2]}
+    
+    road_trends = {}
+    for r in [0, 1, 2]:
+        counts = road_counts_10[r][-5:]
+        if len(counts) >= 2:
+            if counts[-1] > counts[0]:
+                road_trends[r] = '上升'
+            elif counts[-1] < counts[0]:
+                road_trends[r] = '下降'
+            else:
+                road_trends[r] = '平稳'
+        else:
+            road_trends[r] = '平稳'
+    
+    n0 = int(round(road_means_weighted[0]))
+    n1 = int(round(road_means_weighted[1]))
+    n2 = int(round(road_means_weighted[2]))
+    
+    for r in [0, 1, 2]:
+        if road_trends[r] == '上升':
+            if r == 0: n0 += 1
+            elif r == 1: n1 += 1
+            else: n2 += 1
+        elif road_trends[r] == '下降':
+            if r == 0: n0 -= 1
+            elif r == 1: n1 -= 1
+            else: n2 -= 1
+    
+    total = n0 + n1 + n2
+    diff = total - 20
+    if diff != 0:
+        for _ in range(abs(diff)):
+            if diff > 0:
+                if n0 > n1 and n0 > n2: n0 -= 1
+                elif n1 > n2: n1 -= 1
+                else: n2 -= 1
+            else:
+                if n0 < n1 and n0 < n2: n0 += 1
+                elif n1 < n2: n1 += 1
+                else: n2 += 1
+    
+    return (n0, n1, n2), {'means': road_means_weighted, 'trends': road_trends, 'means_recent5': road_means_recent5, 'means_far5': road_means_far5}
+
+def predict_sum_range(data):
+    """和值区间预判（辅助校验项）"""
+    if len(data) < 6:
+        return None, None
+    
+    recent_5 = data.head(5)
+    sums = []
+    for _, row in recent_5.iterrows():
+        nums = [int(n) for n in row.values if pd.notna(n)]
+        sums.append(get_sum_value(nums))
+    
+    last_sum = sums[-1]
+    amplitudes = [abs(sums[i] - sums[i-1]) for i in range(1, len(sums))]
+    amax = max(amplitudes) if amplitudes else 0
+    
+    sum_min = int(last_sum - amax * 0.6)
+    sum_max = int(last_sum + amax * 0.6)
+    
+    return (sum_min, sum_max), {'last_sum': last_sum, 'amax': amax}
+
+# ==================== 【第二层：中观杀号层】 ====================
+
+def segment_position_kill(data, all_numbers):
+    """第一重：分段位次杀号（彩侠核心方法）- 按位次划分而非号码值范围"""
+    if len(data) < 11:
+        return []
+    
+    position_segments = [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19)
+    ]
+    
+    kill_pool = []
+    
+    for seg_idx, (start_pos, end_pos) in enumerate(position_segments):
+        recent_5 = data.head(5)
+        recent_10 = data.head(10)
+        full_data = data
+        
+        def get_segment_mean(d, start_pos, end_pos):
+            total = 0
+            count = 0
+            for _, row in d.iterrows():
+                nums = sorted([int(n) for n in row.values if pd.notna(n)])
+                if len(nums) > end_pos:
+                    seg_nums_in_row = nums[start_pos:end_pos + 1]
+                    total += sum(seg_nums_in_row)
+                    count += len(seg_nums_in_row)
+            return total / count if count > 0 else 40
+        
+        m5 = get_segment_mean(recent_5, start_pos, end_pos)
+        m10 = get_segment_mean(recent_10, start_pos, end_pos)
+        m_full = get_segment_mean(full_data, start_pos, end_pos)
+        
+        m = m5 * 0.5 + m10 * 0.3 + m_full * 0.2
+        
+        seg_numbers = []
+        for _, row in data.iterrows():
+            nums = sorted([int(n) for n in row.values if pd.notna(n)])
+            if len(nums) > end_pos:
+                seg_numbers.extend(nums[start_pos:end_pos + 1])
+        seg_numbers = sorted(set(seg_numbers))
+        
+        if not seg_numbers:
+            continue
+        
+        deviations = []
+        for n in seg_numbers:
+            deviation = abs(n - m)
+            hotness = calculate_hotness(data, n, 10)
+            deviations.append((n, deviation, hotness))
+        
+        deviations.sort(key=lambda x: x[1], reverse=True)
+        
+        cold_kill = deviations[:2]
+        hot_kill = sorted(deviations, key=lambda x: x[2], reverse=True)[:2]
+        
+        for n, _, _ in cold_kill:
+            if n not in kill_pool:
+                kill_pool.append(n)
+        for n, _, _ in hot_kill:
+            if n not in kill_pool:
+                kill_pool.append(n)
+    
+    return sorted(kill_pool)[:20]
+
+def road_count_kill(data, road_counts, all_numbers):
+    """第二重：012路个数杀号（菲姐核心方法）"""
+    n0, n1, n2 = road_counts
+    kill_pool = []
+    
+    for road, keep_count in [(0, n0 + 2), (1, n1 + 2), (2, n2 + 2)]:
+        road_nums = get_road_numbers(road)
+        
+        hotness_list = []
+        for n in road_nums:
+            hotness = calculate_hotness(data, n, 10)
+            hotness_list.append((n, hotness))
+        
+        hotness_list.sort(key=lambda x: x[1], reverse=True)
+        
+        keep_nums = set(n for n, _ in hotness_list[:keep_count])
+        
+        for n in road_nums:
+            if n not in keep_nums:
+                kill_pool.append(n)
+    
+    return sorted(kill_pool)
+
+def generate_final_kill_pool(data, road_counts, all_numbers):
+    """生成最终杀号池"""
+    first_kill = segment_position_kill(data, all_numbers)
+    second_kill = road_count_kill(data, road_counts, all_numbers)
+    
+    first_set = set(first_kill)
+    second_set = set(second_kill)
+    
+    final_kill = sorted(list(first_set & second_set))
+    
+    if len(final_kill) < 10:
+        cold_nums = []
+        for n in second_kill:
+            if n not in final_kill:
+                cold_nums.append((n, calculate_hotness(data, n, 10)))
+        cold_nums.sort(key=lambda x: x[1])
+        for n, _ in cold_nums[:10 - len(final_kill)]:
+            final_kill.append(n)
+    
+    final_kill = sorted(final_kill)[:10]
+    
+    watch_list = sorted(list(first_set - second_set))[:10]
+    
+    return final_kill, watch_list, {'first_kill': first_kill, 'second_kill': second_kill}
+
+# ==================== 【第三层：微观选号层】 ====================
+
+def build_expert_sources(data, road_counts):
+    """构建三位专家的号码来源"""
+    n0, n1, n2 = road_counts
+    
+    feijie_nums = []
+    for road, top_n in [(0, 2), (1, 3), (2, 3)]:
+        road_nums = get_road_numbers(road)
+        hotness_list = [(n, calculate_hotness(data, n, 10)) for n in road_nums]
+        hotness_list.sort(key=lambda x: x[1], reverse=True)
+        feijie_nums.extend([n for n, _ in hotness_list[:top_n]])
+    
+    caixia_nums = []
+    position_segments = [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19)
+    ]
+    for start_pos, end_pos in position_segments:
+        seg_nums = []
+        for _, row in data.iterrows():
+            nums = sorted([int(n) for n in row.values if pd.notna(n)])
+            if len(nums) > end_pos:
+                seg_nums.extend(nums[start_pos:end_pos + 1])
+        seg_nums = sorted(set(seg_nums))
+        if seg_nums:
+            hotness_list = [(n, calculate_hotness(data, n, 10)) for n in seg_nums]
+            hotness_list.sort(key=lambda x: x[1], reverse=True)
+            caixia_nums.extend([n for n, _ in hotness_list[:3]])
+    
+    fange_nums = []
+    road_2_nums = get_road_numbers(2)
+    hotness_list = [(n, calculate_hotness(data, n, 10)) for n in road_2_nums]
+    hotness_list.sort(key=lambda x: x[1], reverse=True)
+    fange_nums.extend([n for n, _ in hotness_list[:5]])
+    
+    odd_nums = get_odd_numbers()
+    even_nums = get_even_numbers()
+    odd_hotness = sum(calculate_hotness(data, n, 10) for n in odd_nums) / len(odd_nums)
+    even_hotness = sum(calculate_hotness(data, n, 10) for n in even_nums) / len(even_nums)
+    if odd_hotness > even_hotness:
+        fange_nums.extend([n for n in odd_nums if calculate_hotness(data, n, 10) >= 2][:5])
+    else:
+        fange_nums.extend([n for n in even_nums if calculate_hotness(data, n, 10) >= 2][:5])
+    
+    return {
+        'feijie': sorted(set(feijie_nums)),
+        'caixia': sorted(set(caixia_nums)),
+        'fange': sorted(set(fange_nums))
+    }
+
+def calculate_overlap_score(sources, num):
+    """计算号码重合度评分"""
+    score = 0
+    if num in sources['feijie']:
+        score += 1
+    if num in sources['caixia']:
+        score += 1
+    if num in sources['fange']:
+        score += 1
+    return score
+
+def generate_gradient_pools(data, sources, watch_list, span_range, odd_range, road_counts):
+    """梯度式号码池生成 - 动态评分版本"""
+    all_numbers = get_all_numbers()
+    
+    scored_nums = []
+    for n in all_numbers:
+        score = calculate_overlap_score(sources, n)
+        omission = calculate_omission(data, n)
+        hotness = calculate_hotness(data, n, 10)
+        
+        hotness_recent3 = calculate_hotness(data, n, 3)
+        hotness_trend = hotness_recent3 - (hotness - hotness_recent3) / 7
+        
+        omission_score = 0
+        if 3 <= omission <= 7:
+            omission_score = 2
+        elif omission >= 8:
+            omission_score = 1
+        elif omission <= 2:
+            omission_score = -1
+        
+        dynamic_score = score * 3 + omission_score + hotness_trend * 0.5
+        
+        scored_nums.append((n, dynamic_score, score, omission, hotness))
+    
+    scored_nums.sort(key=lambda x: (-x[1], -x[2], x[3], -x[4]))
+    
+    def validate_pool(pool, span_range, odd_range, road_counts, min_size=5):
+        if not pool:
+            return False
+        nums = list(pool)
+        if len(nums) < min_size:
+            return True
+        
+        span = max(nums) - min(nums)
+        odd_count = get_odd_count(nums)
+        n0 = get_road_count(nums, 0)
+        n1 = get_road_count(nums, 1)
+        n2 = get_road_count(nums, 2)
+        
+        span_ok = span_range[0] <= span <= span_range[1]
+        odd_ok = odd_range[0] <= odd_count <= odd_range[1]
+        road_ok = abs(n0 - road_counts[0]) <= 1 and abs(n1 - road_counts[1]) <= 1 and abs(n2 - road_counts[2]) <= 1
+        
+        return span_ok and odd_ok and road_ok
+    
+    pools = {}
+    
+    scored_list = [n for n, _, _, _, _ in scored_nums]
+    
+    dan_dan = []
+    for n, dyn_score, score, omission, hotness in scored_nums:
+        if score >= 2 and 3 <= omission <= 7:
+            dan_dan = [n]
+            break
+    if not dan_dan:
+        dan_dan = [scored_list[0]]
+    
+    pools['独胆'] = dan_dan
+    
+    shuang_dan = []
+    remaining = [n for n in scored_list if n != dan_dan[0]]
+    for n in remaining[:5]:
+        pool = [dan_dan[0], n]
+        if validate_pool(pool, span_range, odd_range, road_counts):
+            shuang_dan.append(pool)
+        else:
+            shuang_dan.append(pool)
+    pools['双胆'] = shuang_dan[:5]
+    
+    san_ma = []
+    for sd in shuang_dan[:4]:
+        for n in remaining:
+            if n not in sd:
+                pool = sd + [n]
+                if validate_pool(pool, span_range, odd_range, road_counts):
+                    san_ma.append(pool)
+                    break
+    pools['三码'] = san_ma[:4]
+    
+    core_5 = []
+    used = set(dan_dan)
+    for n, dyn_score, score, omission, hotness in scored_nums:
+        if n not in used:
+            core_5.append(n)
+            used.add(n)
+            if len(core_5) == 4:
+                break
+    core_5 = dan_dan + core_5
+    pools['5码核心池'] = core_5
+    
+    pool_10 = core_5.copy()
+    for n, dyn_score, score, omission, hotness in scored_nums:
+        if n not in pool_10:
+            pool_10.append(n)
+            if len(pool_10) == 10:
+                break
+    pools['10码池'] = pool_10
+    
+    pool_15 = pool_10.copy()
+    warm_nums = []
+    for n, dyn_score, score, omission, hotness in scored_nums:
+        if n not in pool_15 and score >= 1 and 3 <= omission <= 7:
+            warm_nums.append(n)
+    pool_15.extend(warm_nums[:5])
+    pools['15码池'] = pool_15
+    
+    pool_17 = pool_15.copy()
+    cold_watch = sorted([n for n in watch_list], key=lambda x: calculate_hotness(data, x, 10))[:2]
+    pool_17.extend(cold_watch)
+    pools['17码池'] = pool_17
+    
+    pool_20 = pool_17.copy()
+    cold_nums = []
+    for n, dyn_score, score, omission, hotness in scored_nums:
+        if n not in pool_20 and omission >= 8:
+            cold_nums.append(n)
+    pool_20.extend(cold_nums[:3])
+    pools['20码池'] = pool_20
+    
+    for key in pools:
+        pools[key] = sorted(pools[key])
+    
+    return pools, {'scored_nums': scored_nums}
 
 # ==================== 【模块1】全局配置与数据持久化 ====================
 st.set_page_config(
@@ -677,7 +1269,10 @@ tabs = st.tabs([
     '📈 Tab 6 后段库（41-80）',
     '📋 Tab 7 体系全流程 SOP',
     '🔮 Tab 8 预测结果',
-    '⚙️ Tab 9 预留板块'
+    '⚙️ Tab 9 预留板块',
+    '🎯 Tab 10 三维融合预测',
+    '📚 Tab 11 三维融合体系',
+    '🔗 Tab 12 选号策略体系'
 ])
 
 # ==================== 【Tab 1】号码库管理 ====================
@@ -701,20 +1296,20 @@ with tabs[0]:
         # 1. 新增数据
         st.subheader('➕ 新增开奖号码')
         
-        # 自动生成下一期期号
+        # 自动生成下一期期号（最新期号+1）
         def generate_next_period():
             if not st.session_state.lottery_data.empty:
                 max_period = st.session_state.lottery_data.index[-1]
                 # 解析期号：前4位是年份，后3位是期数
                 year = int(max_period[:4])
                 period_num = int(max_period[4:])
-                # 假设每年最多150期，超过则进入下一年
-                if period_num >= 150:
+                # 期数+1，超过999则进入下一年
+                next_period_num = period_num + 1
+                if next_period_num > 999:
                     next_year = year + 1
                     next_period_num = 1
                 else:
                     next_year = year
-                    next_period_num = period_num + 1
                 return f"{next_year}{next_period_num:03d}"
             else:
                 # 默认起始期号
@@ -913,17 +1508,19 @@ with tabs[1]:
     st.divider()
 
     # 1. 周期选择
-    period_options = [150, 100, 80, 50, 20, 10, 5]
+    period_options = ['全部', 100, 50, 30, 10, 5]
     selected_period = st.selectbox(
         '请选择分析周期',
         period_options,
-        index=3,
-        help='选择要分析的最近N期数据'
+        index=0,
+        help='选择要分析的最近N期数据，"全部"表示使用所有数据（150期以上）'
     )
 
     # 获取最近N期数据
     data = st.session_state.lottery_data
-    if len(data) >= selected_period:
+    if selected_period == '全部':
+        recent_data = data
+    elif len(data) >= selected_period:
         recent_data = data.tail(selected_period)
     else:
         recent_data = data
@@ -1017,168 +1614,222 @@ with tabs[2]:
     
     data = st.session_state.lottery_data
     
-    analysis_periods = [80, 40, 20, 10]
+    analysis_periods = ['全部', 100, 50, 30, 10, 5]
     selected_period = st.selectbox(
         '请选择分析周期',
         analysis_periods,
-        index=1,
+        index=0,
         key='tab3_analysis_period'
     )
     
-    min_data_needed = selected_period + 1
+    if selected_period == '全部':
+        min_data_needed = 2
+    else:
+        min_data_needed = selected_period + 1
     
     if len(data) >= min_data_needed:
         period_list = sorted(data.index.tolist())
-        selected_draw_period = st.selectbox(
-            '请选择开奖期数',
-            period_list,
-            index=len(period_list)-1,
-            key='tab3_period_select'
-        )
         
-        period_idx = period_list.index(selected_draw_period)
-        if period_idx >= selected_period:
-            before_periods = period_list[period_idx-selected_period:period_idx]
+        if selected_period == '全部':
+            available_periods = period_list[1:]
         else:
-            before_periods = period_list[:period_idx]
+            available_periods = period_list[selected_period:]
         
-        draw_numbers = sorted(data.loc[selected_draw_period].dropna().astype(int).tolist())
-        
-        st.markdown(f'''<div style="background-color: #e3f2fd; padding: 16px; border-radius: 8px; margin-bottom: 12px;">
-        <h4 style="color: #1565c0; margin-top: 0;">📌 {selected_draw_period}期开奖号码</h4>
-        <p style="font-family: monospace; font-size: 16px;">{' '.join(f'{n:02d}' for n in draw_numbers)}</p>
-        <p style="font-size: 12px; color: #666;">分析前{len(before_periods)}期（期数：{before_periods[0]}~{before_periods[-1]}）的跟随号</p>
-        </div>''', unsafe_allow_html=True)
-        
-        def get_follow_numbers(data, target_num, before_periods):
-            follow_nums = []
-            for i in range(len(before_periods) - 1):
-                current_period = before_periods[i]
-                next_period = before_periods[i+1]
-                current_nums = set(data.loc[current_period].dropna().astype(int).tolist())
-                next_nums = set(data.loc[next_period].dropna().astype(int).tolist())
-                if target_num in current_nums:
-                    follow_nums.extend(list(next_nums))
-            return follow_nums
-        
-        all_follow_results = []
-        num_follow_sets = {}
-        for num in draw_numbers:
-            follow_nums = get_follow_numbers(data, num, before_periods)
-            if follow_nums:
-                freq = pd.Series(follow_nums).value_counts()
-                top5 = freq.head(5).to_dict()
-                all_follow_results.append({
-                    '号码': num,
-                    '跟随次数': len(follow_nums),
-                    '跟随号码数': len(set(follow_nums)),
-                    '前5跟随号': top5
-                })
-                num_follow_sets[num] = set(top5.keys())
-        
-        if all_follow_results:
-            common_follow_counts = {}
-            for num, follow_set in num_follow_sets.items():
-                for follow_num in follow_set:
-                    if follow_num not in common_follow_counts:
-                        common_follow_counts[follow_num] = {'关联数': 0, '关联号码': [], '总次数': 0}
-                    common_follow_counts[follow_num]['关联数'] += 1
-                    common_follow_counts[follow_num]['关联号码'].append(num)
-            
-            for follow_num, info in common_follow_counts.items():
-                total_count = 0
-                for result in all_follow_results:
-                    if follow_num in result['前5跟随号']:
-                        total_count += result['前5跟随号'][follow_num]
-                common_follow_counts[follow_num]['总次数'] = total_count
-            
-            common_follows = sorted(
-                common_follow_counts.items(),
-                key=lambda x: (-x[1]['关联数'], -x[1]['总次数'])
+        if not available_periods:
+            st.warning(f'⚠️ 数据不足，无法选择符合{selected_period}期周期要求的开奖期数')
+        else:
+            selected_draw_period = st.selectbox(
+                '请选择开奖期数',
+                available_periods,
+                index=len(available_periods)-1,
+                key='tab3_period_select'
             )
             
-            multi_common = [(num, info) for num, info in common_follows if info['关联数'] >= 2]
+            period_idx = period_list.index(selected_draw_period)
+            if selected_period == '全部':
+                before_periods = period_list[:period_idx]
+            else:
+                before_periods = period_list[period_idx-selected_period:period_idx]
             
-            if multi_common:
-                st.subheader('⭐ 共同跟随号（关联≥2个开奖号码）')
+            draw_numbers = sorted(data.loc[selected_draw_period].dropna().astype(int).tolist())
+            
+            st.markdown(f'''<div style="background-color: #e3f2fd; padding: 16px; border-radius: 8px; margin-bottom: 12px;">
+            <h4 style="color: #1565c0; margin-top: 0;">📌 {selected_draw_period}期开奖号码</h4>
+            <p style="font-family: monospace; font-size: 16px;">{' '.join(f'{n:02d}' for n in draw_numbers)}</p>
+            <p style="font-size: 12px; color: #666;">分析前{len(before_periods)}期（期数：{before_periods[0]}~{before_periods[-1]}）的跟随号</p>
+            </div>''', unsafe_allow_html=True)
+            
+            def get_follow_numbers(data, target_num, before_periods):
+                follow_nums = []
+                for i in range(len(before_periods) - 1):
+                    current_period = before_periods[i]
+                    next_period = before_periods[i+1]
+                    current_nums = set(data.loc[current_period].dropna().astype(int).tolist())
+                    next_nums = set(data.loc[next_period].dropna().astype(int).tolist())
+                    if target_num in current_nums:
+                        follow_nums.extend(list(next_nums))
+                return follow_nums
+            
+            all_follow_results = []
+            num_follow_sets = {}
+            for num in draw_numbers:
+                follow_nums = get_follow_numbers(data, num, before_periods)
+                if follow_nums:
+                    freq = pd.Series(follow_nums).value_counts()
+                    top3 = freq.head(3).to_dict()
+                    all_follow_results.append({
+                        '号码': num,
+                        '跟随次数': len(follow_nums),
+                        '跟随号码数': len(set(follow_nums)),
+                        '前3跟随号': top3
+                    })
+                    num_follow_sets[num] = set(top3.keys())
+            
+            if all_follow_results:
+                common_follow_counts = {}
+                for num, follow_set in num_follow_sets.items():
+                    for follow_num in follow_set:
+                        if follow_num not in common_follow_counts:
+                            common_follow_counts[follow_num] = {'关联数': 0, '关联号码': [], '总次数': 0}
+                        common_follow_counts[follow_num]['关联数'] += 1
+                        common_follow_counts[follow_num]['关联号码'].append(num)
                 
+                for follow_num, info in common_follow_counts.items():
+                    total_count = 0
+                    for result in all_follow_results:
+                        if follow_num in result['前3跟随号']:
+                            total_count += result['前3跟随号'][follow_num]
+                    common_follow_counts[follow_num]['总次数'] = total_count
+                
+                common_follows = sorted(
+                    common_follow_counts.items(),
+                    key=lambda x: (-x[1]['关联数'], -x[1]['总次数'])
+                )
+                
+                multi_common = [(num, info) for num, info in common_follows if info['关联数'] >= 2]
+                
+                if multi_common:
+                    st.subheader('⭐ 共同跟随号（关联≥2个开奖号码）')
+                    
+                    rows = []
+                    for num, info in multi_common[:10]:
+                        rows.append({
+                            '跟随号码': num,
+                            '关联开奖号码数': info['关联数'],
+                            '总跟随次数': info['总次数'],
+                            '关联开奖号码': ', '.join(f'{n:02d}' for n in sorted(info['关联号码']))
+                        })
+                    
+                    df_common = pd.DataFrame(rows)
+                    st.dataframe(df_common, use_container_width=True, hide_index=True)
+                    
+                    st.markdown(f'''
+                    <div style="background-color: #e8f5e8; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
+                    <span style="color: #2e7d32;">💡 提示：以上号码是多个开奖号码共同的跟随号，值得重点关注</span>
+                    </div>
+                    ''', unsafe_allow_html=True)
+            
+            st.subheader('📊 各号码跟随号分析')
+            
+            for result in all_follow_results:
+                st.markdown(f'''
+                <div style="background-color: #fff3e0; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
+                <h4 style="margin-top: 0; color: #ef6c00;">🔗 号码 {result['号码']:02d} 的跟随号</h4>
+                <p style="font-size: 14px; color: #666;">出现 {result['跟随次数']} 次，共 {result['跟随号码数']} 个不同跟随号</p>
+                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 6px; margin-top: 8px;">
+                {''.join([f'<div style="background-color: #fff; padding: 6px; border-radius: 4px; text-align: center; font-size: 13px;">\n<span style="font-weight: bold; color: #c62828;">{k:02d}</span>\n<span style="color: #666; font-size: 11px;">({v}次)</span>\n</div>' for k, v in result['前3跟随号'].items()])}
+                </div>
+                </div>
+                ''', unsafe_allow_html=True)
+            
+            st.subheader('🔥 综合跟随号排行榜')
+            
+            combined_follow = {}
+            for result in all_follow_results:
+                for follow_num, count in result['前3跟随号'].items():
+                    if follow_num not in combined_follow:
+                        combined_follow[follow_num] = {'次数': 0, '关联号码': []}
+                    combined_follow[follow_num]['次数'] += count
+                    combined_follow[follow_num]['关联号码'].append(result['号码'])
+            
+            sorted_combined = sorted(
+                combined_follow.items(),
+                key=lambda x: (-x[1]['次数'], -len(x[1]['关联号码']))
+            )[:15]
+            
+            if sorted_combined:
                 rows = []
-                for num, info in multi_common[:10]:
+                for num, info in sorted_combined:
                     rows.append({
                         '跟随号码': num,
-                        '关联开奖号码数': info['关联数'],
-                        '总跟随次数': info['总次数'],
+                        '总跟随次数': info['次数'],
+                        '关联开奖号码数': len(info['关联号码']),
                         '关联开奖号码': ', '.join(f'{n:02d}' for n in sorted(info['关联号码']))
                     })
                 
-                df_common = pd.DataFrame(rows)
-                st.dataframe(df_common, use_container_width=True, hide_index=True)
+                df_top = pd.DataFrame(rows)
+                st.dataframe(df_top, use_container_width=True, hide_index=True)
+            
+            st.subheader('🎯 跟随号唯一号码池')
+            
+            all_unique_follow_nums = sorted(set(
+                follow_num for result in all_follow_results 
+                for follow_num in result['前3跟随号'].keys()
+            ))
+            
+            if all_unique_follow_nums:
+                year = int(selected_draw_period[:4])
+                period_num = int(selected_draw_period[4:])
+                next_period_num = period_num + 1
+                next_period = f"{year}{next_period_num:03d}"
                 
-                st.markdown(f'''
-                <div style="background-color: #e8f5e8; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
-                <span style="color: #2e7d32;">💡 提示：以上号码是多个开奖号码共同的跟随号，值得重点关注</span>
-                </div>
-                ''', unsafe_allow_html=True)
-        
-        st.subheader('📊 各号码跟随号分析')
-        
-        for result in all_follow_results:
-            st.markdown(f'''
-            <div style="background-color: #fff3e0; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
-            <h4 style="margin-top: 0; color: #ef6c00;">🔗 号码 {result['号码']:02d} 的跟随号</h4>
-            <p style="font-size: 14px; color: #666;">出现 {result['跟随次数']} 次，共 {result['跟随号码数']} 个不同跟随号</p>
-            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 6px; margin-top: 8px;">
-            {''.join([f'<div style="background-color: #fff; padding: 6px; border-radius: 4px; text-align: center; font-size: 13px;">\n<span style="font-weight: bold; color: #c62828;">{k:02d}</span>\n<span style="color: #666; font-size: 11px;">({v}次)</span>\n</div>' for k, v in result['前5跟随号'].items()])}
-            </div>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        st.subheader('🔥 综合跟随号排行榜')
-        
-        combined_follow = {}
-        for result in all_follow_results:
-            for follow_num, count in result['前5跟随号'].items():
-                if follow_num not in combined_follow:
-                    combined_follow[follow_num] = {'次数': 0, '关联号码': []}
-                combined_follow[follow_num]['次数'] += count
-                combined_follow[follow_num]['关联号码'].append(result['号码'])
-        
-        sorted_combined = sorted(
-            combined_follow.items(),
-            key=lambda x: (-x[1]['次数'], -len(x[1]['关联号码']))
-        )[:15]
-        
-        if sorted_combined:
-            rows = []
-            for num, info in sorted_combined:
-                rows.append({
-                    '跟随号码': num,
-                    '总跟随次数': info['次数'],
-                    '关联开奖号码数': len(info['关联号码']),
-                    '关联开奖号码': ', '.join(f'{n:02d}' for n in sorted(info['关联号码']))
-                })
-            
-            df_top = pd.DataFrame(rows)
-            st.dataframe(df_top, use_container_width=True, hide_index=True)
-        
-        st.subheader('🎯 跟随号唯一号码池')
-        
-        all_unique_follow_nums = sorted(set(
-            follow_num for result in all_follow_results 
-            for follow_num in result['前5跟随号'].keys()
-        ))
-        
-        if all_unique_follow_nums:
-            st.markdown(f'''<div style="background-color: #f3e5f5; padding: 16px; border-radius: 8px;">
-            <h4 style="color: #6a1b9a; margin-top: 0;">📋 唯一跟随号号码池（共 {len(all_unique_follow_nums)} 个）</h4>
-            <p style="font-family: monospace; font-size: 16px; letter-spacing: 2px;">{' '.join(f'{n:02d}' for n in all_unique_follow_nums)}</p>
-            </div>''', unsafe_allow_html=True)
-            
-            st.markdown(f'''<div style="background-color: #e8f5e8; padding: 12px; border-radius: 6px; margin-top: 12px;">
-            <span style="color: #2e7d32;">💡 提示：以上号码是所有开奖号码跟随号的去重集合，可作为选号参考</span>
-            </div>''', unsafe_allow_html=True)
-        else:
-            st.info('暂无跟随号数据')
+                if 'follow_pool_dict' not in st.session_state:
+                    st.session_state.follow_pool_dict = {}
+                st.session_state.follow_pool_dict[next_period] = {
+                    'unique_follow_nums': all_unique_follow_nums,
+                    'draw_numbers': draw_numbers,
+                    'analysis_period': selected_period,
+                    'source_period': selected_draw_period,
+                    'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                st.session_state.follow_unique_pool = all_unique_follow_nums
+                
+                st.markdown(f'''<div style="background-color: #f3e5f5; padding: 16px; border-radius: 8px;">
+                <h4 style="color: #6a1b9a; margin-top: 0;">📋 唯一跟随号号码池（共 {len(all_unique_follow_nums)} 个）</h4>
+                <p style="font-family: monospace; font-size: 16px; letter-spacing: 2px;">{' '.join(f'{n:02d}' for n in all_unique_follow_nums)}</p>
+                </div>''', unsafe_allow_html=True)
+                
+                st.markdown(f'''<div style="background-color: #e8f5e8; padding: 12px; border-radius: 6px; margin-top: 12px;">
+                <span style="color: #2e7d32;">💡 提示：以上号码是所有开奖号码跟随号的去重集合，可作为选号参考</span>
+                </div>''', unsafe_allow_html=True)
+                
+                follow_data = {
+                    'period': selected_period,
+                    'analysis_period': selected_period,
+                    'draw_period': selected_draw_period,
+                    'target_period': next_period,
+                    'draw_numbers': draw_numbers,
+                    'unique_follow_nums': all_unique_follow_nums,
+                    'count': len(all_unique_follow_nums),
+                    'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                os.makedirs('follow_data', exist_ok=True)
+                filename = f'follow_data/{next_period}跟随号.json'
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(follow_data, f, ensure_ascii=False, indent=2)
+                st.success(f'✅ 数据已自动保存到 {filename}')
+                
+                col_save = st.columns(1)
+                with col_save[0]:
+                    json_str = json.dumps(all_unique_follow_nums, ensure_ascii=False)
+                    st.download_button(
+                        '📥 下载号码池',
+                        data=json_str,
+                        file_name=f'{next_period}跟随号.json',
+                        mime='application/json'
+                    )
+            else:
+                st.info('暂无跟随号数据')
     else:
         st.warning(f'⚠️ 数据不足 {min_data_needed} 期，无法进行{selected_period}期跟随号分析')
 
@@ -1190,11 +1841,13 @@ with tabs[3]:
 
     if len(st.session_state.lottery_data) >= 5:
         data = st.session_state.lottery_data
-        analysis_periods = [20, 10, 5]
         
         def calculate_combinations(data, period, combo_size):
             """计算指定周期内的组合出现次数（去重保证唯一性）"""
-            recent_data = data.tail(period) if len(data) >= period else data
+            if period == '全部':
+                recent_data = data
+            else:
+                recent_data = data.tail(period) if len(data) >= period else data
             combo_counts = defaultdict(int)
             for idx, row in recent_data.iterrows():
                 nums = sorted(set(row.dropna().astype(int).tolist()))
@@ -1216,27 +1869,64 @@ with tabs[3]:
         combo_size_map = {'双码同出': 2, '三码同出': 3, '四码同出': 4, '五码同出': 5}
         combo_size = combo_size_map[combo_type]
         
-        tab_all, tab_trend, tab_new, tab_recent5 = st.tabs(['📈 全周期对比', '📉 频率递增', '✨ 近5期新增', '🔥 近5期出现'])
+        period_options = ['全部', 100, 50, 30, 10, 5]
+        selected_period = st.selectbox(
+            '选择分析周期',
+            period_options,
+            index=0,
+            key='tab4_period_select'
+        )
+        
+        if selected_period == '全部':
+            long_period = '全部'
+            mid_period = 50
+            short_period = 10
+        elif selected_period == 100:
+            long_period = 100
+            mid_period = 50
+            short_period = 10
+        elif selected_period == 50:
+            long_period = 50
+            mid_period = 30
+            short_period = 5
+        elif selected_period == 30:
+            long_period = 30
+            mid_period = 10
+            short_period = 5
+        elif selected_period == 10:
+            long_period = 10
+            mid_period = 5
+            short_period = 3
+        else:
+            long_period = 5
+            mid_period = 3
+            short_period = 2
+        
+        tab_all, tab_trend, tab_new, tab_recent5 = st.tabs(['📈 全周期对比', '📉 频率递增', '✨ 近期新增', '🔥 近期出现'])
         
         with tab_all:
-            combo_20, _ = calculate_combinations(data, 20, combo_size)
-            combo_10, _ = calculate_combinations(data, 10, combo_size)
-            combo_5, _ = calculate_combinations(data, 5, combo_size)
+            combo_long, _ = calculate_combinations(data, long_period, combo_size)
+            combo_mid, _ = calculate_combinations(data, mid_period, combo_size)
+            combo_short, _ = calculate_combinations(data, short_period, combo_size)
             
-            all_combos = set(combo_20.keys()) | set(combo_10.keys()) | set(combo_5.keys())
+            long_label = '全部期' if long_period == '全部' else f'近{long_period}期'
+            mid_label = f'近{mid_period}期'
+            short_label = f'近{short_period}期'
+            
+            all_combos = set(combo_long.keys()) | set(combo_mid.keys()) | set(combo_short.keys())
             
             rows = []
             for combo in all_combos:
-                cnt_20 = combo_20.get(combo, 0)
-                cnt_10 = combo_10.get(combo, 0)
-                cnt_5 = combo_5.get(combo, 0)
-                max_cnt = max(cnt_20, cnt_10, cnt_5)
+                cnt_long = combo_long.get(combo, 0)
+                cnt_mid = combo_mid.get(combo, 0)
+                cnt_short = combo_short.get(combo, 0)
+                max_cnt = max(cnt_long, cnt_mid, cnt_short)
                 if max_cnt > 2:
                     rows.append({
                         '组合': format_combo(combo),
-                        '近20期': cnt_20,
-                        '近10期': cnt_10,
-                        '近5期': cnt_5,
+                        long_label: cnt_long,
+                        mid_label: cnt_mid,
+                        short_label: cnt_short,
                         '最高次数': max_cnt
                     })
             
@@ -1252,46 +1942,51 @@ with tabs[3]:
             st.dataframe(df, use_container_width=True, hide_index=True)
         
         with tab_trend:
+            trend_label = f'{short_label} > {mid_label} > {long_label}'
             st.markdown(f'''<div style="background-color: #e8f5e8; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
-            <span style="color: #2e7d32;">📈 频率递增{combo_type}：近5期出现 > 近10期出现 > 近20期出现</span>
+            <span style="color: #2e7d32;">📈 频率递增{combo_type}：{trend_label}</span>
             </div>''', unsafe_allow_html=True)
             
-            combo_5, _ = calculate_combinations(data, 5, combo_size)
-            combo_10, _ = calculate_combinations(data, 10, combo_size)
-            combo_20, _ = calculate_combinations(data, 20, combo_size)
+            combo_short, _ = calculate_combinations(data, short_period, combo_size)
+            combo_mid, _ = calculate_combinations(data, mid_period, combo_size)
+            combo_long, _ = calculate_combinations(data, long_period, combo_size)
             
             increasing_combos = []
-            for combo, cnt_5 in combo_5.items():
-                cnt_10 = combo_10.get(combo, 0)
-                cnt_20 = combo_20.get(combo, 0)
-                if cnt_5 > cnt_10 > cnt_20:
-                    increasing_combos.append((combo, cnt_5, cnt_10, cnt_20))
+            for combo, cnt_short in combo_short.items():
+                cnt_mid = combo_mid.get(combo, 0)
+                cnt_long = combo_long.get(combo, 0)
+                if cnt_short > cnt_mid > cnt_long:
+                    increasing_combos.append((combo, cnt_short, cnt_mid, cnt_long))
             
             increasing_combos.sort(key=lambda x: (-x[1], x[0]))
             
             if increasing_combos:
                 rows = []
-                for combo, cnt_5, cnt_10, cnt_20 in increasing_combos:
+                for combo, cnt_short, cnt_mid, cnt_long in increasing_combos:
                     rows.append({
                         '组合': format_combo(combo),
-                        '近5期': cnt_5,
-                        '近10期': cnt_10,
-                        '近20期': cnt_20
+                        short_label: cnt_short,
+                        mid_label: cnt_mid,
+                        long_label: cnt_long
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
                 st.info(f'暂无频率递增的{combo_type}组合')
         
         with tab_new:
+            new_label = f'{short_label}出现 > 0 且{mid_label}出现 = 0'
             st.markdown(f'''<div style="background-color: #f3e5f5; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
-            <span style="color: #7b1fa2;">✨ 近5期新增{combo_type}：近5期出现 > 0 且近10期出现 = 0</span>
+            <span style="color: #7b1fa2;">✨ 近期新增{combo_type}：{new_label}</span>
             </div>''', unsafe_allow_html=True)
             
+            combo_short, _ = calculate_combinations(data, short_period, combo_size)
+            combo_mid, _ = calculate_combinations(data, mid_period, combo_size)
+            
             new_combos = []
-            for combo, cnt_5 in combo_5.items():
-                cnt_10 = combo_10.get(combo, 0)
-                if cnt_5 > 0 and cnt_10 == 0:
-                    new_combos.append((combo, cnt_5))
+            for combo, cnt_short in combo_short.items():
+                cnt_mid = combo_mid.get(combo, 0)
+                if cnt_short > 0 and cnt_mid == 0:
+                    new_combos.append((combo, cnt_short))
             
             new_combos.sort(key=lambda x: (-x[1], x[0]))
             
@@ -1300,21 +1995,26 @@ with tabs[3]:
                 for combo, cnt in new_combos:
                     rows.append({
                         '组合': format_combo(combo),
-                        '近5期出现次数': cnt
+                        f'{short_label}出现次数': cnt
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
-                st.info(f'暂无近5期新增的{combo_type}组合')
+                st.info(f'暂无近期新增的{combo_type}组合')
         
         with tab_recent5:
+            recent_period = short_period
+            recent_label = '全部期' if recent_period == '全部' else f'近{recent_period}期'
             st.markdown(f'''<div style="background-color: #ffebee; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
-            <span style="color: #c62828;">🔥 近5期出现{combo_type}：显示所有在近5期出现过的组合</span>
+            <span style="color: #c62828;">🔥 {recent_label}出现{combo_type}：显示所有在{recent_label}出现过的组合</span>
             </div>''', unsafe_allow_html=True)
             
-            recent_5_data = data.tail(5)
+            if recent_period == '全部':
+                recent_data = data
+            else:
+                recent_data = data.tail(recent_period)
             
             combo_period_map = {}
-            for period_idx, (period, row) in enumerate(recent_5_data.iterrows()):
+            for period_idx, (period, row) in enumerate(recent_data.iterrows()):
                 nums = sorted(set(row.dropna().astype(int).tolist()))
                 for combo in itertools.combinations(nums, combo_size):
                     if combo not in combo_period_map:
@@ -1330,199 +2030,172 @@ with tabs[3]:
                     '出现在期数': ', '.join(info['期数'])
                 })
             
-            df_recent5 = pd.DataFrame(rows)
-            df_recent5 = df_recent5.sort_values('出现次数', ascending=False)
+            df_recent = pd.DataFrame(rows)
+            df_recent = df_recent.sort_values('出现次数', ascending=False)
             
             st.markdown(f'''
             <div style="background-color: #ffebee; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
-            <span style="color: #c62828;">📊 {combo_type} - 近5期共 {len(df_recent5)} 组数据</span>
+            <span style="color: #c62828;">📊 {combo_type} - {recent_label}共 {len(df_recent)} 组数据</span>
             </div>
             ''', unsafe_allow_html=True)
             
-            st.dataframe(df_recent5, use_container_width=True, hide_index=True)
+            st.dataframe(df_recent, use_container_width=True, hide_index=True)
     else:
         st.warning('⚠️ 数据不足 5 期，无法进行分析')
 
-# ==================== 【Tab 5】前段库（1-40区间） ====================
+# ==================== 【Tab 5】跟随号与杀号对比 ====================
 with tabs[4]:
-    st.header('🎯 前段库（1-40区间）')
-    st.markdown('''<div style="background-color: #e3f2fd; padding: 12px; border-radius: 6px; margin-bottom: 16px;">
-    <span style="color: #1565c0;">🔄 自动同步自 Tab 1 号码库</span>
+    st.header('🔄 跟随号与杀号对比')
+    st.markdown('''<div style="background-color: #e3f2fd; padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+    <p style="font-size: 16px; line-height: 1.6;">对接 Tab 3（跟随号）和 Tab 10（杀号）数据，按期号一一对应显示，相同号码标注，列出剩余跟随号码。</p>
+    <p style="font-size: 14px; color: #666;">🔴 深红=与杀号相同 | 🟠 橙色=与观察号相同</p>
     </div>''', unsafe_allow_html=True)
-    st.divider()
     
-    if len(st.session_state.lottery_data) > 0:
-        front_segment_data = {}
-        
-        for period in st.session_state.lottery_data.index:
-            numbers = st.session_state.lottery_data.loc[period].tolist()
-            front_numbers = sorted([int(n) for n in numbers if 1 <= n <= 40])
-            if front_numbers:
-                front_segment_data[period] = front_numbers
-        
-        total_periods = len(front_segment_data)
-        avg_count = sum(len(v) for v in front_segment_data.values()) / total_periods if total_periods > 0 else 0
-        
-        col_stats1, col_stats2 = st.columns(2)
-        with col_stats1:
-            st.markdown(f'''
-            <div style="background-color: #e8f5e8; padding: 16px; border-radius: 8px;">
-                <h4 style="margin-top: 0; color: #2e7d32;">📊 数据概览</h4>
-                <p style="font-size: 20px; font-weight: bold;">共 {total_periods} 期数据</p>
-                <p>平均每期前段号码：{avg_count:.1f} 个</p>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        with col_stats2:
-            st.markdown(f'''
-            <div style="background-color: #fff3e0; padding: 16px; border-radius: 8px;">
-                <h4 style="margin-top: 0; color: #ef6c00;">🎯 区间范围</h4>
-                <p style="font-size: 20px; font-weight: bold;">1 ~ 40</p>
-                <p>总计可能号码：40 个</p>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        st.divider()
-        st.subheader('📋 前段库号码详情')
-        
-        display_period_list = list(front_segment_data.keys())
-        
-        col_filter1, col_filter2 = st.columns([1, 2])
-        with col_filter1:
-            quick_range = st.selectbox('快速选择', ['全部', '最近10期', '最近20期', '最近30期'], index=1, key='front_quick_range')
-        with col_filter2:
-            search_period = st.text_input('搜索期号', placeholder='输入关键词', key='front_search')
-        
-        if display_period_list:
-            if quick_range == '最近10期':
-                filtered_periods = display_period_list[-10:]
-            elif quick_range == '最近20期':
-                filtered_periods = display_period_list[-20:]
-            elif quick_range == '最近30期':
-                filtered_periods = display_period_list[-30:]
-            else:
-                filtered_periods = display_period_list
-            
-            if search_period:
-                filtered_periods = [p for p in filtered_periods if search_period in p]
-            
-            filtered_periods.reverse()
-            
-            st.markdown(f'''
-            <div style="display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
-            <span style="background-color: #e3f2fd; padding: 6px 12px; border-radius: 4px; font-size: 12px;">📊 总期数: {total_periods}</span>
-            <span style="background-color: #e8f5e8; padding: 6px 12px; border-radius: 4px; font-size: 12px;">🔢 当前: {len(filtered_periods)}期</span>
-            <span style="background-color: #fff3e0; padding: 6px 12px; border-radius: 4px; font-size: 12px;">🆕 最新: {display_period_list[-1]}</span>
-            </div>
-            ''', unsafe_allow_html=True)
-            
-            for period in filtered_periods:
-                nums = front_segment_data[period]
-                nums_str = ' '.join(f'{n:02d}' for n in nums)
-                
-                st.markdown(f'''
-                <div style="background-color: #f8f9fa; padding: 10px 14px; border-radius: 5px; margin-bottom: 6px;">
-                <div style="display: flex; align-items: center; justify-content: space-between;">
-                <span style="font-weight: bold; color: #1565c0; font-size: 13px;">{period}</span>
-                <span style="font-family: monospace; font-size: 12px; color: #333;">{nums_str}</span>
-                </div>
-                </div>
-                ''', unsafe_allow_html=True)
-        else:
-            st.info('暂无数据')
+    follow_dict = st.session_state.get('follow_pool_dict', {})
+    kill_dict = {}
+    if os.path.exists('kill_data'):
+        for filename in os.listdir('kill_data'):
+            if filename.endswith('杀号.json'):
+                period = filename.replace('杀号.json', '')
+                try:
+                    with open(f'kill_data/{filename}', 'r', encoding='utf-8') as f:
+                        kill_dict[period] = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    pass
+    
+    valid_periods = sorted([p for p in follow_dict if p in kill_dict], reverse=True)
+    
+    if not valid_periods:
+        st.warning('⚠️ 暂无完整数据')
     else:
-        st.warning('⚠️ 暂无开奖数据，请先在 Tab 1 中添加')
+        for target_period in valid_periods:
+            follow_data = follow_dict[target_period]
+            kill_data = kill_dict[target_period]
+            follow_nums = follow_data['unique_follow_nums']
+            kill_nums = kill_data['final_kill']
+            watch_nums = kill_data.get('watch_list', [])
+            source_period = follow_data.get('source_period', '')
+            
+            follow_set = set(follow_nums)
+            kill_set = set(kill_nums)
+            watch_set = set(watch_nums)
+            
+            kill_common = sorted(follow_set & kill_set)
+            watch_common = sorted(follow_set & watch_set)
+            remaining_nums = sorted(follow_set - kill_set - watch_set)
+            
+            st.markdown(f'''<div style="background-color: #f5f5f5; padding: 14px; border-radius: 8px; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="font-weight: bold; color: #1565c0;">{target_period}期</span>
+            <span style="font-size: 12px; color: #666;">{source_period}期跟随 → {target_period}期</span>
+            </div>
+            <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 200px;">
+            <span style="font-size: 12px; color: #6a1b9a;">跟随号:</span>
+            <span style="font-family: monospace; font-size: 16px; margin-left: 4px;">{' '.join(f'<span style="color: #c62828; font-weight: bold;">{n:02d}</span>' if n in kill_set else f'<span style="color: #ef6c00; font-weight: bold;">{n:02d}</span>' if n in watch_set else f'{n:02d}' for n in follow_nums)}</span>
+            </div>
+            <div style="flex: 1; min-width: 200px;">
+            <span style="font-size: 12px; color: #c62828;">杀号:</span>
+            <span style="font-family: monospace; font-size: 16px; margin-left: 4px;">{' '.join(f'<span style="color: #c62828; font-weight: bold;">{n:02d}</span>' if n in follow_set else f'{n:02d}' for n in kill_nums)}</span>
+            </div>
+            </div>
+            <div style="margin-top: 8px;">
+            <span style="font-size: 12px; color: #2e7d32;">剩余:</span>
+            <span style="font-family: monospace; font-size: 18px; font-weight: bold; margin-left: 4px;">{' '.join(f'{n:02d}' for n in remaining_nums)}</span>
+            </div>
+            </div>''', unsafe_allow_html=True)
+            
+            if remaining_nums:
+                os.makedirs('remaining_data', exist_ok=True)
+                remaining_filename = f'remaining_data/{target_period}剩余.json'
+                with open(remaining_filename, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'period': target_period,
+                        'source_period': source_period,
+                        'remaining_nums': remaining_nums,
+                        'follow_nums': follow_nums,
+                        'kill_nums': kill_nums,
+                        'watch_nums': watch_nums,
+                        'kill_common': kill_common,
+                        'watch_common': watch_common,
+                        'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }, f, ensure_ascii=False, indent=2)
 
-# ==================== 【Tab 6】后段库（41-80区间） ====================
+# ==================== 【Tab 6】剩余号码与开奖对比 ====================
 with tabs[5]:
-    st.header('📈 后段库（41-80区间）')
-    st.markdown('''<div style="background-color: #e3f2fd; padding: 12px; border-radius: 6px; margin-bottom: 16px;">
-    <span style="color: #1565c0;">🔄 自动同步自 Tab 1 号码库</span>
+    st.header('📊 剩余号码 vs 开奖号码对比')
+    st.markdown('''<div style="background-color: #e3f2fd; padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+    <p style="font-size: 16px; line-height: 1.6;">对接 Tab 1（号码库）和 Tab 5（剩余号码）数据，按期号一一对应对比。</p>
+    <p style="font-size: 14px; color: #666;">🔴 红色=命中开奖号码</p>
     </div>''', unsafe_allow_html=True)
-    st.divider()
     
-    if len(st.session_state.lottery_data) > 0:
-        back_segment_data = {}
-        
-        for period in st.session_state.lottery_data.index:
-            numbers = st.session_state.lottery_data.loc[period].tolist()
-            back_numbers = sorted([int(n) for n in numbers if 41 <= n <= 80])
-            if back_numbers:
-                back_segment_data[period] = back_numbers
-        
-        st.session_state['back_segment_data'] = back_segment_data
-        total_periods = len(back_segment_data)
-        avg_count = sum(len(v) for v in back_segment_data.values()) / total_periods if total_periods > 0 else 0
-        
-        col_stats1, col_stats2 = st.columns(2)
-        with col_stats1:
-            st.markdown(f'''
-            <div style="background-color: #e8f5e8; padding: 16px; border-radius: 8px;">
-                <h4 style="margin-top: 0; color: #2e7d32;">📊 数据概览</h4>
-                <p style="font-size: 20px; font-weight: bold;">共 {total_periods} 期数据</p>
-                <p>平均每期后段号码：{avg_count:.1f} 个</p>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        with col_stats2:
-            st.markdown(f'''
-            <div style="background-color: #fff3e0; padding: 16px; border-radius: 8px;">
-                <h4 style="margin-top: 0; color: #ef6c00;">🎯 区间范围</h4>
-                <p style="font-size: 20px; font-weight: bold;">41 ~ 80</p>
-                <p>总计可能号码：40 个</p>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        st.divider()
-        st.subheader('📋 后段库号码详情')
-        
-        display_period_list = list(back_segment_data.keys())
-        
-        col_filter1, col_filter2 = st.columns([1, 2])
-        with col_filter1:
-            quick_range = st.selectbox('快速选择', ['全部', '最近10期', '最近20期', '最近30期'], index=1, key='back_quick_range')
-        with col_filter2:
-            search_period = st.text_input('搜索期号', placeholder='输入关键词', key='back_search')
-        
-        if display_period_list:
-            if quick_range == '最近10期':
-                filtered_periods = display_period_list[-10:]
-            elif quick_range == '最近20期':
-                filtered_periods = display_period_list[-20:]
-            elif quick_range == '最近30期':
-                filtered_periods = display_period_list[-30:]
-            else:
-                filtered_periods = display_period_list
-            
-            if search_period:
-                filtered_periods = [p for p in filtered_periods if search_period in p]
-            
-            filtered_periods.reverse()
-            
-            st.markdown(f'''
-            <div style="display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
-            <span style="background-color: #e3f2fd; padding: 6px 12px; border-radius: 4px; font-size: 12px;">📊 总期数: {total_periods}</span>
-            <span style="background-color: #e8f5e8; padding: 6px 12px; border-radius: 4px; font-size: 12px;">🔢 当前: {len(filtered_periods)}期</span>
-            <span style="background-color: #fff3e0; padding: 6px 12px; border-radius: 4px; font-size: 12px;">🆕 最新: {display_period_list[-1]}</span>
-            </div>
-            ''', unsafe_allow_html=True)
-            
-            for period in filtered_periods:
-                nums = back_segment_data[period]
-                nums_str = ' '.join(f'{n:02d}' for n in nums)
-                
-                st.markdown(f'''
-                <div style="background-color: #f8f9fa; padding: 10px 14px; border-radius: 5px; margin-bottom: 6px;">
-                <div style="display: flex; align-items: center; justify-content: space-between;">
-                <span style="font-weight: bold; color: #1565c0; font-size: 13px;">{period}</span>
-                <span style="font-family: monospace; font-size: 12px; color: #333;">{nums_str}</span>
-                </div>
-                </div>
-                ''', unsafe_allow_html=True)
-        else:
-            st.info('暂无数据')
+    lottery_data = st.session_state.lottery_data
+    remaining_dict = {}
+    if os.path.exists('remaining_data'):
+        for filename in os.listdir('remaining_data'):
+            if filename.endswith('剩余.json'):
+                period = filename.replace('剩余.json', '')
+                try:
+                    with open(f'remaining_data/{filename}', 'r', encoding='utf-8') as f:
+                        remaining_dict[period] = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    pass
+    
+    valid_periods = sorted([p for p in lottery_data.index if p in remaining_dict], reverse=True)
+    
+    if not valid_periods:
+        st.warning('⚠️ 暂无完整对比数据')
     else:
-        st.warning('⚠️ 暂无开奖数据，请先在 Tab 1 中添加')
+        hit_stats = []
+        for period in valid_periods:
+            draw_numbers = sorted([int(n) for n in lottery_data.loc[period].dropna().tolist()])
+            remaining_nums = remaining_dict[period].get('remaining_nums', [])
+            hit_count = len(set(draw_numbers) & set(remaining_nums))
+            hit_stats.append({'period': period, 'hit': hit_count, 'total': len(remaining_nums)})
+        
+        st.markdown('''<div style="background-color: #e8f5e8; padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+        <h4 style="margin-top: 0; color: #2e7d32;">📈 命中统计</h4>
+        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+        <thead>
+        <tr style="background-color: #c8e6c9;">
+        <th style="border: 1px solid #a5d6a7; padding: 8px; text-align: left;">期号</th>
+        <th style="border: 1px solid #a5d6a7; padding: 8px; text-align: center;">剩余号码</th>
+        <th style="border: 1px solid #a5d6a7; padding: 8px; text-align: center;">命中数量</th>
+        </tr>
+        </thead>
+        <tbody>
+        ''' + ''.join([f'''<tr>
+        <td style="border: 1px solid #a5d6a7; padding: 8px;">{stat['period']}</td>
+        <td style="border: 1px solid #a5d6a7; padding: 8px; text-align: center;">{stat['total']}</td>
+        <td style="border: 1px solid #a5d6a7; padding: 8px; text-align: center;"><span style="color: #c62828; font-weight: bold;">{stat['hit']}</span></td>
+        </tr>''' for stat in hit_stats]) + '''
+        </tbody>
+        </table>
+        </div>''', unsafe_allow_html=True)
+        
+        for period in valid_periods:
+            draw_numbers = sorted([int(n) for n in lottery_data.loc[period].dropna().tolist()])
+            remaining_nums = remaining_dict[period].get('remaining_nums', [])
+            draw_set = set(draw_numbers)
+            remaining_set = set(remaining_nums)
+            hit_nums = sorted(remaining_set & draw_set)
+            
+            st.markdown(f'''<div style="background-color: #f5f5f5; padding: 14px; border-radius: 8px; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="font-weight: bold; color: #1565c0;">{period}期</span>
+            <span style="font-size: 12px; color: #2e7d32;">命中 <span style="font-weight: bold;">{len(hit_nums)}</span> 个</span>
+            </div>
+            <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 200px;">
+            <span style="font-size: 12px; color: #6a1b9a;">剩余:</span>
+            <span style="font-family: monospace; font-size: 16px; margin-left: 4px;">{' '.join(f'<span style="color: #c62828; font-weight: bold;">{n:02d}</span>' if n in draw_set else f'{n:02d}' for n in remaining_nums)}</span>
+            </div>
+            <div style="flex: 1; min-width: 200px;">
+            <span style="font-size: 12px; color: #2e7d32;">开奖:</span>
+            <span style="font-family: monospace; font-size: 16px; margin-left: 4px;">{' '.join(f'<span style="color: #c62828; font-weight: bold;">{n:02d}</span>' if n in remaining_set else f'{n:02d}' for n in draw_numbers)}</span>
+            </div>
+            </div>
+            </div>''', unsafe_allow_html=True)
 
 # ==================== 【Tab 7】体系全流程 SOP（完整实现） ====================
 with tabs[6]:
@@ -2925,7 +3598,10 @@ with tabs[8]:
         data = st.session_state.lottery_data
         
         def calculate_combinations(data, period, combo_size):
-            recent_data = data.tail(period) if len(data) >= period else data
+            if period == '全部':
+                recent_data = data
+            else:
+                recent_data = data.tail(period) if len(data) >= period else data
             combo_counts = {}
             for idx, row in recent_data.iterrows():
                 nums = sorted(set(row.dropna().astype(int).tolist()))
@@ -2948,6 +3624,43 @@ with tabs[8]:
             key='tab9_combo_size'
         )
         
+        period_options = ['全部', 100, 50, 30, 10, 5]
+        selected_period = st.selectbox(
+            '选择分析周期',
+            period_options,
+            index=0,
+            key='tab9_period_select'
+        )
+        
+        if selected_period == '全部':
+            long_period = '全部'
+            mid_period = 50
+            short_period = 10
+        elif selected_period == 100:
+            long_period = 100
+            mid_period = 50
+            short_period = 10
+        elif selected_period == 50:
+            long_period = 50
+            mid_period = 30
+            short_period = 5
+        elif selected_period == 30:
+            long_period = 30
+            mid_period = 10
+            short_period = 5
+        elif selected_period == 10:
+            long_period = 10
+            mid_period = 5
+            short_period = 3
+        else:
+            long_period = 5
+            mid_period = 3
+            short_period = 2
+        
+        long_label = '全部期' if long_period == '全部' else f'近{long_period}期'
+        mid_label = f'近{mid_period}期'
+        short_label = f'近{short_period}期'
+        
         combo_size_map = {'三码同出': 3, '四码同出': 4, '五码同出': 5}
         size = combo_size_map[combo_size]
         
@@ -2968,13 +3681,13 @@ with tabs[8]:
                 <span style="color: #1565c0;">📌 输入号码：{', '.join(str(n) for n in input_nums)}</span>
                 </div>''', unsafe_allow_html=True)
                 
-                combo_20 = calculate_combinations(data, 20, size)
-                combo_10 = calculate_combinations(data, 10, size)
-                combo_5 = calculate_combinations(data, 5, size)
+                combo_long = calculate_combinations(data, long_period, size)
+                combo_mid = calculate_combinations(data, mid_period, size)
+                combo_short = calculate_combinations(data, short_period, size)
                 
                 all_combos = {}
-                for combo, cnt in combo_20.items():
-                    all_combos[combo] = {'近20期': cnt, '近10期': combo_10.get(combo, 0), '近5期': combo_5.get(combo, 0)}
+                for combo, cnt in combo_long.items():
+                    all_combos[combo] = {long_label: cnt, mid_label: combo_mid.get(combo, 0), short_label: combo_short.get(combo, 0)}
                 
                 matching_combos = []
                 for combo, counts in all_combos.items():
@@ -2986,14 +3699,14 @@ with tabs[8]:
                                 '组合': '-'.join(f'{n:02d}' for n in combo),
                                 '匹配输入': ', '.join(str(n) for n in matched_input),
                                 '关联号码': ', '.join(str(n) for n in other_nums),
-                                '近20期': counts['近20期'],
-                                '近10期': counts['近10期'],
-                                '近5期': counts['近5期'],
+                                long_label: counts[long_label],
+                                mid_label: counts[mid_label],
+                                short_label: counts[short_label],
                                 '匹配数': len(matched_input)
                             })
                 
                 df_matching = pd.DataFrame(matching_combos)
-                df_matching = df_matching.sort_values(['匹配数', '近20期'], ascending=[False, False])
+                df_matching = df_matching.sort_values(['匹配数', long_label], ascending=[False, False])
                 
                 st.subheader('📊 包含输入号码的同出组合')
                 st.markdown(f'''<div style="background-color: #e8f5e8; padding: 12px; border-radius: 6px; margin-bottom: 12px;">
@@ -3017,8 +3730,9 @@ with tabs[8]:
                                     if in_num in combo:
                                         num_association[num]['匹配输入'].add(in_num)
                 
+                filtered_associations = {k: v for k, v in num_association.items() if v['关联次数'] >= 2}
                 sorted_associations = sorted(
-                    num_association.items(),
+                    filtered_associations.items(),
                     key=lambda x: (-x[1]['关联次数'], -len(x[1]['匹配输入']))
                 )[:10]
                 
@@ -3052,3 +3766,422 @@ with tabs[8]:
             st.info('💡 请在上方输入框中输入号码，系统将搜索与之关联的号码组合')
     else:
         st.warning('⚠️ 数据不足 5 期，无法进行分析')
+
+# ==================== 【Tab 10】三层体系预测系统 ====================
+with tabs[9]:
+    st.header('🎯 乐8三维融合预测系统')
+    st.markdown('''<div style="background-color: #f0f2f6; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
+    <p style="font-size: 16px; line-height: 1.6;">基于Tab 11三维融合体系架构实现的完整预测系统，对接Tab 1号码库数据。</p>
+    <ul style="margin-top: 10px; font-size: 14px;">
+    <li>✅ 第一层：宏观边界层（跨度预判 → 奇偶比预判 → 012路预判 → 和值校验）</li>
+    <li>✅ 第二层：中观杀号层（双重交叉验证，10个杀号+10个待观察号）</li>
+    <li>✅ 第三层：微观选号层（梯度体系 + 重合度评分）</li>
+    </ul>
+    </div>''', unsafe_allow_html=True)
+    
+    st.markdown('### 📋 基础规范（与Tab 11一致）')
+    col_spec1, col_spec2 = st.columns(2)
+    with col_spec1:
+        st.markdown('''
+        **冷热号定义（近10期）:**
+        - 热号：出现≥5次
+        - 温号：出现3-4次
+        - 冷号：出现≤2次
+        ''')
+    with col_spec2:
+        st.markdown('''
+        **分段标准（彩侠原版）:**
+        - 1段：01-20 | 2段：10-40 | 3段：30-60 | 4段：40-70 | 5段：60-80
+        ''')
+    
+    if st.session_state.lottery_data.empty:
+        st.warning('⚠️ 请先在Tab 1中添加号码数据')
+    else:
+        period_list = st.session_state.lottery_data.index.tolist()[::-1]
+        
+        col_period, col_button = st.columns([1, 2])
+        
+        with col_period:
+            selected_base_period = st.selectbox('选择基准期数（预测下一期号码）', period_list, index=0)
+        
+        if st.button('🚀 执行预测', type='primary', use_container_width=True):
+            original_index = st.session_state.lottery_data.index.get_loc(selected_base_period)
+            if original_index < 9:
+                st.warning(f'⚠️ 数据不足，{selected_base_period}期之前只有{original_index}期数据，无法进行完整预测')
+                st.stop()
+            
+            data = st.session_state.lottery_data.iloc[:original_index + 1]
+            
+            all_numbers = get_all_numbers()
+            
+            year = int(selected_base_period[:4])
+            period_num = int(selected_base_period[4:])
+            next_year = year
+            next_period_num = period_num + 1
+            target_period = f"{next_year}{next_period_num:03d}"
+            
+            st.markdown(f'''<div style="background-color: #e3f2fd; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
+            <h4 style="margin-top: 0; color: #1565c0;">🎯 预测目标期号</h4>
+            <p style="font-size: 24px; font-weight: bold;">{target_period}</p>
+            <p style="font-size: 14px; color: #666;">基准期号：{selected_base_period} | 基于该期及之前共{len(data)}期历史数据进行预测</p>
+            </div>''', unsafe_allow_html=True)
+            
+            st.subheader('📊 第一层：宏观边界层')
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown('### 3.1 跨度预判（菲姐・振幅周期法）')
+                st.markdown('*统计周期：近10期，近5期权重70%，远5期权重30%*')
+                span_range, period_type, span_info = predict_span(data)
+                if span_range:
+                    st.markdown(f'''
+                    - **周期类型**: {period_type}
+                    - **上期振幅**: {span_info['amplitudes'][-1]}
+                    - **本期跨度区间**: <span style="color: #c62828; font-weight: bold;">{span_range[0]}-{span_range[1]}</span>
+                    ''', unsafe_allow_html=True)
+                    st.markdown(f'''<div style="background-color: #fff3e0; padding: 12px; border-radius: 6px;">
+                    <small>近10期跨度: {span_info['spans']}</small>
+                    </div>''', unsafe_allow_html=True)
+                else:
+                    st.info('数据不足，无法进行跨度预判')
+            
+            with col2:
+                st.markdown('### 3.2 奇偶比预判（凡哥・冷热转换法）')
+                st.markdown('*统计周期：近7期+近3期，近3期权重60%，远4期权重40%*')
+                odd_range, even_range, ratio_info = predict_odd_even_ratio(data)
+                if odd_range:
+                    st.markdown(f'''
+                    - **近7期差值D7**: {ratio_info['d7']}
+                    - **近3期差值D3**: {ratio_info['d3']}
+                    - **加权差值**: {ratio_info['weighted_diff']:.1f}
+                    - **奇数预判**: {odd_range[0]}-{odd_range[1]} 个
+                    - **偶数预判**: {even_range[0]}-{even_range[1]} 个
+                    - **奇偶比区间**: <span style="color: #c62828; font-weight: bold;">{odd_range[0]}-{odd_range[1]}:{even_range[0]}-{even_range[1]}</span>
+                    ''', unsafe_allow_html=True)
+                else:
+                    st.info('数据不足，无法进行奇偶比预判')
+            
+            col3, col4 = st.columns(2)
+            
+            with col3:
+                st.markdown('### 3.3 012路个数预判（菲姐・趋势均值法）')
+                st.markdown('*统计周期：近10期+近5期，近5期权重60%，远5期权重40%*')
+                road_counts, road_info = predict_road_counts(data)
+                if road_counts:
+                    n0, n1, n2 = road_counts
+                    st.markdown(f'''
+                    - **0路均值(近5期)**: {road_info['means_recent5'][0]:.1f} | (远5期): {road_info['means_far5'][0]:.1f} | 趋势: {road_info['trends'][0]}
+                    - **1路均值(近5期)**: {road_info['means_recent5'][1]:.1f} | (远5期): {road_info['means_far5'][1]:.1f} | 趋势: {road_info['trends'][1]}
+                    - **2路均值(近5期)**: {road_info['means_recent5'][2]:.1f} | (远5期): {road_info['means_far5'][2]:.1f} | 趋势: {road_info['trends'][2]}
+                    - **本期预判**: <span style="color: #c62828; font-weight: bold;">0路{n0}个 | 1路{n1}个 | 2路{n2}个</span>
+                    ''', unsafe_allow_html=True)
+                else:
+                    st.info('数据不足，无法进行012路预判')
+            
+            with col4:
+                st.markdown('### 3.4 和值区间预判（辅助校验）')
+                sum_range, sum_info = predict_sum_range(data)
+                if sum_range:
+                    st.markdown(f'''
+                    - **上期和值**: {sum_info['last_sum']}
+                    - **最大振幅**: {sum_info['amax']}
+                    - **本期和值区间**: <span style="color: #c62828; font-weight: bold;">{sum_range[0]}-{sum_range[1]}</span>
+                    ''', unsafe_allow_html=True)
+                else:
+                    st.info('数据不足，无法进行和值预判')
+            
+            st.divider()
+            
+            st.subheader('🗡️ 第二层：中观杀号层')
+            
+            if road_counts:
+                final_kill, watch_list, kill_info = generate_final_kill_pool(data, road_counts, all_numbers)
+                
+                col_k1, col_k2 = st.columns(2)
+                
+                with col_k1:
+                    st.markdown('### 4.1 第一重：分段位次杀号（彩侠核心方法）')
+                    st.markdown('*权重分配：近5期0.5、近10期0.3、全周期0.2*')
+                    st.markdown(f'**第一重杀号池（{len(kill_info["first_kill"])}个）:**')
+                    st.markdown(' '.join(f'{n:02d}' for n in kill_info['first_kill']))
+                
+                with col_k2:
+                    st.markdown('### 4.2 第二重：012路个数杀号（菲姐核心方法）')
+                    st.markdown(f'**第二重杀号池（{len(kill_info["second_kill"])}个）:**')
+                    st.markdown(' '.join(f'{n:02d}' for n in kill_info['second_kill']))
+                
+                follow_kill = []
+                follow_pool_info = None
+                
+                if 'follow_pool_dict' in st.session_state and st.session_state.follow_pool_dict:
+                    if target_period in st.session_state.follow_pool_dict:
+                        follow_pool_info = st.session_state.follow_pool_dict[target_period]
+                        follow_pool = follow_pool_info['unique_follow_nums']
+                        source_period = follow_pool_info.get('source_period', selected_base_period)
+                        
+                        follow_kill = []
+                        for num in follow_pool:
+                            hotness = calculate_hotness(data, num, 10)
+                            if hotness >= 5:
+                                follow_kill.append(num)
+                        
+                        st.markdown('### 4.3 第三重：跟随号杀号（对接Tab 3）')
+                        st.markdown(f'*期号对应：{source_period}期跟随 → {target_period}期（{len(follow_pool)}个）中热度≥5的号码*')
+                        st.markdown(f'**第三重杀号池（{len(follow_kill)}个）:**')
+                        st.markdown(' '.join(f'{n:02d}' for n in follow_kill))
+                    else:
+                        st.markdown('### 4.3 第三重：跟随号杀号（对接Tab 3）')
+                        st.info(f'⚠️ 未找到{target_period}期的跟随号数据，请先在Tab 3中分析{selected_base_period}期数据')
+                
+                if follow_kill:
+                    final_kill = sorted(list(set(final_kill) | set(follow_kill)))[:10]
+                
+                col_k3, col_k4 = st.columns(2)
+                
+                with col_k3:
+                    st.markdown('### 4.4 最终杀号池')
+                    st.markdown(f'''<div style="background-color: #ffebee; padding: 16px; border-radius: 8px;">
+                    <h4 style="margin-top: 0; color: #c62828;">🎯 杀号（10个）</h4>
+                    <p style="font-family: monospace; font-size: 18px; font-weight: bold;">{' '.join(f'{n:02d}' for n in final_kill)}</p>
+                    </div>''', unsafe_allow_html=True)
+                
+                with col_k4:
+                    st.markdown('### 待观察号')
+                    st.markdown(f'''<div style="background-color: #e3f2fd; padding: 16px; border-radius: 8px;">
+                    <h4 style="margin-top: 0; color: #1565c0;">👀 待观察号（{len(watch_list)}个）</h4>
+                    <p style="font-family: monospace; font-size: 16px;">{' '.join(f'{n:02d}' for n in watch_list)}</p>
+                    <p style="font-size: 12px; color: #666;">选号时优先级最低</p>
+                    </div>''', unsafe_allow_html=True)
+                
+                st.markdown('**容错机制**: 默认保留2个杀号容错，即允许10个杀号中开出2个')
+                
+                kill_data = {
+                    'target_period': target_period,
+                    'base_period': selected_base_period,
+                    'final_kill': final_kill,
+                    'watch_list': watch_list,
+                    'first_kill': kill_info['first_kill'],
+                    'second_kill': kill_info['second_kill'],
+                    'follow_kill': follow_kill,
+                    'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                os.makedirs('kill_data', exist_ok=True)
+                kill_filename = f'kill_data/{target_period}杀号.json'
+                with open(kill_filename, 'w', encoding='utf-8') as f:
+                    json.dump(kill_data, f, ensure_ascii=False, indent=2)
+                st.success(f'✅ 最终杀号池已自动保存到 {kill_filename}')
+            else:
+                st.info('请先完成第一层宏观边界预判')
+            
+
+
+# ==================== 【Tab 11】乐8三维融合预测体系 ====================
+with tabs[10]:
+    st.header('📚 乐8三维融合预测体系 V1.0')
+    st.markdown('''
+## 体系概述
+
+本体系100%基于彩侠、菲姐、凡哥三位专家的经实战验证的核心优势构建，剔除各自短板模块，按「宏观定边界→中观杀垃圾→微观选核心」的三层递进逻辑形成完整闭环，所有规则量化可复现，无主观模糊判断。
+
+---
+
+## 一、体系核心设计理念与架构
+
+### 1. 核心设计原则
+
+- **优势互补原则**：仅保留三位专家准确率经复盘验证的模块，短板模块全部剔除，用其他专家的优势替代。
+- **交叉验证原则**：所有核心结论（杀号、胆码）必须通过至少两种独立逻辑验证，单一方法结论不生效。
+- **优先级递减原则**：宏观指标 > 杀号规则 > 选号结果，低层结论不得推翻高层边界。
+- **风控兜底原则**：所有环节预留容错空间，避免极端走势出现大面积失误。
+
+### 2. 整体三层架构
+
+| 层级 | 核心作用 | 对应专家优势 | 输出结果 |
+|------|----------|--------------|----------|
+| 宏观边界层 | 锁定开奖整体框架，排除90%极端不可能组合 | 菲姐（跨度、012路个数）+ 凡哥（奇偶比） | 跨度区间、奇偶比区间、012路个数、和值区间 |
+| 中观杀号层 | 批量排除低概率号码，将80码压缩至40码以内 | 彩侠（分段位次杀号）+ 菲姐（012路杀号） | 最终杀号10个、待观察号10个 |
+| 微观选号层 | 梯度筛选核心号码，适配全场景投注 | 彩侠（梯度选号体系）+ 多专家重合度 | 独胆、双胆、5/10/15/17/20码分级大底 |
+
+### 3. 适配场景
+
+覆盖快乐8全玩法：选1至选10直选、复式投注、胆拖投注，兼顾小额高频与大额复式需求。
+
+---
+
+## 二、前置基础规范（统一标准，无标准不分析）
+
+所有环节必须遵循以下统一定义，不得自行修改。
+
+### 1. 基础定义
+
+**号码范围：** 01-80，每期开出20个号码，按从小到大排序后分析。
+
+**012路划分：**
+- 0路：除以3余0（03、06、09…78），共27个
+- 1路：除以3余1（01、04、07…79），共27个
+- 2路：除以3余2（02、05、08…80），共26个
+
+**位次分段标准（彩侠原版）：** 将从小到大排序的20个开奖号分为5段
+- 1段：第1-4位，天然区间01-20
+- 2段：第5-8位，天然区间10-40
+- 3段：第9-12位，天然区间30-60
+- 4段：第13-16位，天然区间40-70
+- 5段：第17-20位，天然区间60-80
+
+**冷热号定义：** 基于近10期出现次数
+- 热号：出现≥5次
+- 温号：出现3-4次
+- 冷号：出现≤2次
+
+**遗漏值：** 某号码距离上次开出的间隔期数。
+
+### 2. 核心指标计算公式
+
+- 跨度 = 当期最大开奖号 - 当期最小开奖号
+- 和值 = 当期20个开奖号码之和
+- 奇偶比 = 奇数个数：偶数个数
+- 振幅 = |本期指标值 - 上期指标值|
+
+### 3. 数据周期规范
+
+| 分析环节 | 统计周期 | 权重分配 |
+|----------|----------|----------|
+| 跨度预判 | 近10期 | 近5期权重70%，远5期权重30% |
+| 奇偶比预判 | 近7期 + 近3期 | 近3期权重60%，远4期权重40% |
+| 012路个数预判 | 近10期 + 近5期 | 近5期权重60%，远5期权重40% |
+| 分段杀号 | 近5期 + 近10期 + 全周期 | 近5期0.5、近10期0.3、全周期0.2 |
+''')
+
+# ==================== 【Tab 12】选号策略体系说明书 ====================
+with tabs[11]:
+    st.header('📋 选号策略体系说明书')
+    st.markdown('''
+## 第一层：宏观边界层（定全局框架）
+
+**执行顺序：** 跨度预判 → 奇偶比预判 → 012路个数预判 → 和值区间校验
+
+### 3.1 跨度预判（菲姐・振幅周期法，优先级最高）
+
+**操作步骤：**
+- 提取近10期跨度，计算9个相邻跨度振幅：`振幅n = |跨度n - 跨度n-1|`
+- 判定当前振幅周期：
+  - 收窄期：上期振幅 ≤ 3 → 本期跨度在上期基础上 ±2
+  - 正常期：上期振幅 4-9 → 本期跨度在上期基础上 ±3
+  - 放大期：上期振幅 ≥ 10 → 本期跨度在上期基础上 ±5
+- 在计算出的跨度候选值中，选取近10期出现次数最多的作为主预判值，最终输出「主预判值 ±1」的区间。
+
+**输出标准：** 明确给出本期跨度区间，如 75-77。
+
+### 3.2 奇偶比预判（凡哥・冷热转换法）
+
+**操作步骤：**
+- 统计近7期奇数总个数S7、偶数总个数E7=140-S7，计算差值D7 = |S7-E7|
+- 统计近3期奇数总个数S3、偶数总个数E3=60-S3，计算差值D3 = |S3-E3|
+
+**逻辑判定：**
+- 若D7 ≥ 5（某一方明显偏热）且D3 ≤ 3（近期回归均衡）→ 本期偏冷一方反弹，个数在均值10基础上 +1~+2
+- 若D7 ≤ 4（整体均衡）→ 本期维持均衡，奇数个数9-11
+- 若连续2期某一方个数≥12 → 本期该方回落至10个以内
+
+**输出奇偶比区间，如 11-13:7-9。**
+
+### 3.3 012路个数预判（菲姐・趋势均值法）
+
+**操作步骤：**
+- 计算近10期各路平均出号数：
+  - 0路均值 = 近10期0路总数/10
+  - 1路、2路同理
+- 结合近5期趋势调整：近5期某路个数持续上升则+1，持续下降则-1
+- 最终输出本期各路预判个数N0、N1、N2，三者之和必须等于20，误差允许±1。
+
+### 3.4 和值区间预判（辅助校验项）
+
+- 提取近5期和值，计算最大振幅Amax
+- 本期和值区间 = 上期和值 ± (Amax × 0.6)
+- 仅用于最终大底校验，不参与选号。
+
+### 3.5 宏观指标一致性校验
+
+**校验规则：** 跨度、奇偶比、012路个数三者逻辑自洽，例如跨度小则和值必然偏低，奇数多则1路+2路个数必然偏多。
+
+**修正规则：** 若出现逻辑矛盾，优先修正012路个数，不得修改跨度。
+
+---
+
+## 第二层：中观杀号层（双重交叉验证）
+
+**核心目标：** 杀号准确率≥90%，8个杀号错杀≤1个
+
+### 4.1 第一重：分段位次杀号（彩侠核心方法）
+
+**操作步骤：**
+- 对5个分段分别计算综合均值M：
+  - `M = 近5期均值×0.5 + 近10期均值×0.3 + 全周期均值×0.2`
+- 对该分段对应区间内的所有号码，计算与综合均值M的偏离度：
+  - `偏离度 = |号码 - M|`
+- 每个分段杀掉偏离度最大的4个号码（最冷2个 + 最热2个）
+- 汇总得到第一重候选杀号池，共20个号码。
+
+### 4.2 第二重：012路个数杀号（菲姐核心方法）
+
+**操作步骤：**
+- 基于第一层预判的各路个数N0、N1、N2，对每一路号码按近10期出现次数从高到低排序。
+- 每一路保留「预判个数 + 2」个最热号码，其余全部纳入候选杀号池。
+
+**例：** 预判2路出4个 → 保留最热的6个2路号，其余20个2路号全部进入第二重杀号池
+
+**汇总得到第二重候选杀号池，约60-65个号码。**
+
+### 4.3 最终杀号池生成规则
+
+**入选规则：** 只有同时出现在第一重、第二重杀号池的号码，才能进入最终杀号池。
+
+**数量固定：** 最终杀号固定为8个；若交叉后不足8个，从第二重杀号池中补充最冷的号码补至8个。
+
+**待观察号：** 仅在第一重杀号池、不在第二重的号码，标记为待观察号，共8个；不纳入杀号，但选号时优先级最低。
+
+**容错机制：** 默认保留1个杀号容错，即允许8个杀号中开出1个。
+
+---
+
+## 第三层：微观选号层（梯度体系 + 重合度）
+
+**核心逻辑：** 以重合度为核心，按梯度逐层扩容，全层级匹配宏观指标
+
+### 5.1 核心号码池构建与重合度评分
+
+**号码来源（仅保留三位专家高准确率模块）：**
+- 菲姐来源：012路推荐中，各路排名前3的号码（0路准确率低，仅取前2个）
+- 彩侠来源：分段推荐的核心号、独胆双胆三码中的所有号码
+- 凡哥来源：2路号码推荐的前5个（0路、1路准确率低，全部剔除）；奇偶推荐对应的核心号
+
+**重合度评分规则：**
+- 同时出现在3个来源：3分（最高优先级）
+- 同时出现在2个来源：2分（次高优先级）
+- 仅出现在1个来源：1分（备选优先级）
+
+### 5.2 梯度式号码池生成（彩侠梯度逻辑）
+
+严格按重合度从高到低逐层扩容，每一层都必须通过宏观指标校验。
+
+| 层级 | 号码数 | 规则 |
+|------|--------|------|
+| 独胆 | 1个 | 重合度最高 + 遗漏值3-7期的号码；若多个分数相同，选热度中等的温号 |
+| 双胆 | 5组 | 独胆分别搭配5个次高重合度号码，每组2个 |
+| 三码 | 4组 | 双胆分别搭配第三高重合度号码，每组3个 |
+| 5码核心池 | 5个 | 独胆 + 重合度排名前4的号码 |
+| 10码池 | 10个 | 5码池 + 重合度排名5-9的号码 |
+| 15码池 | 15个 | 10码池 + 5个中等重合度温号 |
+| 17码池 | 17个 | 15码池 + 2个待观察号（选最冷的2个） |
+| 20码池 | 20个 | 17码池 + 3个高遗漏冷号（遗漏≥8期） |
+
+### 5.3 全层级强制校验
+
+每一层号码池生成后，必须满足：
+1. 奇偶个数在第一层预判的区间内
+2. 012路个数与第一层预判误差≤1
+3. 最大号 - 最小号在第一层跨度区间内
+
+**不满足则替换对应号码，直至符合要求。**
+''')
